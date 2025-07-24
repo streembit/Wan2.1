@@ -107,7 +107,12 @@ class WanT2V:
         if dit_fsdp:
             self.model = shard_fn(self.model)
         else:
-            self.model.to(self.device)
+            # Skip automatic GPU loading for 14B model to prevent OOM
+            if config.num_layers == 40:  # 14B model has 40 layers
+                print("Skipping automatic GPU loading for 14B model")
+                # Model stays on CPU, will be moved manually later or with offloading
+            else:
+                self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -236,7 +241,12 @@ class WanT2V:
 
                 timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
+                # Handle model device placement for inference
+                if offload_model:
+                    # Move to GPU for inference, will be moved back to CPU after
+                    self.model.to(self.device)
+                else:
+                    self.model.to(self.device)
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
