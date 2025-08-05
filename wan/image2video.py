@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
 import logging
+from typing import Optional, Callable
 import math
 import os
 import random
@@ -141,7 +142,10 @@ class WanI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 *,
+                 progress_callback: Optional[Callable[[int, int, Optional[str]], None]] = None,
+                 cancel_fn: Optional[Callable[[], bool]] = None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -169,6 +173,13 @@ class WanI2V:
                 Random seed for noise generation. If -1, use random seed
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            progress_callback (`Callable`, *optional*):
+                Callback function(step, total, stage) called during generation
+            cancel_fn (`Callable`, *optional*):
+                Function that returns True to cancel generation
+
+        Raises:
+            RuntimeError: If cancel_fn returns True during generation
 
         Returns:
             torch.Tensor:
@@ -299,27 +310,43 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             self.model.to(self.device)
-            for _, t in enumerate(tqdm(timesteps)):
+            total_steps = len(timesteps)
+            
+            # Guard against zero steps edge case
+            assert total_steps > 0, "sampling_steps must be > 0"
+            
+            # Optional initial progress signal with accurate total
+            if progress_callback:
+                try:
+                    progress_callback(0, total_steps, "prepare")
+                except Exception:
+                    pass
+            
+            # Control TQDM via environment variable for production use
+            use_tqdm = bool(int(os.getenv("WAN_TQDM", "0")))
+            iterator = tqdm(timesteps) if use_tqdm else timesteps
+            
+            # Control aggressive memory clearing
+            aggressive_offload = bool(int(os.getenv("WAN_AGGRESSIVE_OFFLOAD", "0")))
+            empty_cache_interval = 1 if aggressive_offload else 10
+            
+            for step_idx, t in enumerate(iterator, start=1):
+                # Cooperative cancellation
+                if cancel_fn and cancel_fn():
+                    raise RuntimeError("Canceled")
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
                 timestep = torch.stack(timestep).to(self.device)
 
+                # Model forward passes - keep everything on GPU
                 noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0].to(
-                        torch.device('cpu') if offload_model else self.device)
-                if offload_model:
-                    torch.cuda.empty_cache()
+                    latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0].to(
-                        torch.device('cpu') if offload_model else self.device)
-                if offload_model:
-                    torch.cuda.empty_cache()
+                    latent_model_input, t=timestep, **arg_null)[0]
+                
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
-
-                latent = latent.to(
-                    torch.device('cpu') if offload_model else self.device)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -328,16 +355,35 @@ class WanI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
+                
+                # Free intermediate tensors always (helps GC)
+                del latent_model_input, timestep, noise_pred_cond, noise_pred_uncond, noise_pred
+                
+                # Empty cache periodically when offloading
+                if offload_model and step_idx % empty_cache_interval == 0:
+                    torch.cuda.empty_cache()
+                
+                # Progress tick per step
+                if progress_callback:
+                    try:
+                        progress_callback(step_idx, total_steps, "sample")
+                    except Exception:
+                        pass
 
-                x0 = [latent.to(self.device)]
-                del latent_model_input, timestep
-
+            # Build x0 once after the loop
+            x0 = [latent.to(self.device)]
+            
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)
+                if progress_callback:
+                    try:
+                        progress_callback(total_steps, total_steps, "finalize")
+                    except Exception:
+                        pass
 
         del noise, latent
         del sample_scheduler

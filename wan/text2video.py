@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
 import logging
+from typing import Optional, Callable
 import math
 import os
 import random
@@ -126,14 +127,17 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 *,
+                 progress_callback: Optional[Callable[[int, int, Optional[str]], None]] = None,
+                 cancel_fn: Optional[Callable[[], bool]] = None):
         r"""
         Generates video frames from text prompt using diffusion process.
 
         Args:
             input_prompt (`str`):
                 Text prompt for content generation
-            size (tupele[`int`], *optional*, defaults to (1280,720)):
+            size (tuple[`int`], *optional*, defaults to (1280,720)):
                 Controls video resolution, (width,height).
             frame_num (`int`, *optional*, defaults to 81):
                 How many frames to sample from a video. The number should be 4n+1
@@ -141,7 +145,7 @@ class WanT2V:
                 Noise schedule shift parameter. Affects temporal dynamics
             sample_solver (`str`, *optional*, defaults to 'unipc'):
                 Solver used to sample the video.
-            sampling_steps (`int`, *optional*, defaults to 40):
+            sampling_steps (`int`, *optional*, defaults to 50):
                 Number of diffusion sampling steps. Higher values improve quality but slow generation
             guide_scale (`float`, *optional*, defaults 5.0):
                 Classifier-free guidance scale. Controls prompt adherence vs. creativity
@@ -151,6 +155,13 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            progress_callback (`Callable`, *optional*):
+                Callback function(step, total, stage) called during generation
+            cancel_fn (`Callable`, *optional*):
+                Function that returns True to cancel generation
+
+        Raises:
+            RuntimeError: If cancel_fn returns True during generation
 
         Returns:
             torch.Tensor:
@@ -235,18 +246,39 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
+            total_steps = len(timesteps)
+            
+            # Guard against zero steps edge case
+            assert total_steps > 0, "sampling_steps must be > 0"
+            
+            # Move model to GPU once before the loop
+            self.model.to(self.device)
+            
+            # Optional initial progress signal with accurate total
+            if progress_callback:
+                try:
+                    progress_callback(0, total_steps, "prepare")
+                except Exception:
+                    pass
+            
+            # Control TQDM via environment variable for production use
+            use_tqdm = bool(int(os.getenv("WAN_TQDM", "0")))
+            iterator = tqdm(timesteps) if use_tqdm else timesteps
+            
+            # Control aggressive memory clearing
+            aggressive_offload = bool(int(os.getenv("WAN_AGGRESSIVE_OFFLOAD", "0")))
+            empty_cache_interval = 1 if aggressive_offload else 10
+            
+            for step_idx, t in enumerate(iterator, start=1):
+                # Cooperative cancellation
+                if cancel_fn and cancel_fn():
+                    raise RuntimeError("Canceled")
                 latent_model_input = latents
                 timestep = [t]
 
-                timestep = torch.stack(timestep)
+                timestep = torch.stack(timestep).to(self.device)
 
-                # Handle model device placement for inference
-                if offload_model:
-                    # Move to GPU for inference, will be moved back to CPU after
-                    self.model.to(self.device)
-                else:
-                    self.model.to(self.device)
+                # Model forward passes - keep everything on GPU
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
@@ -262,6 +294,20 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+                
+                # Free intermediate tensors always (helps GC)
+                del noise_pred_cond, noise_pred_uncond, noise_pred
+                
+                # Empty cache periodically when offloading
+                if offload_model and step_idx % empty_cache_interval == 0:
+                    torch.cuda.empty_cache()
+                
+                # Progress tick per step
+                if progress_callback:
+                    try:
+                        progress_callback(step_idx, total_steps, "sample")
+                    except Exception:
+                        pass
 
             x0 = latents
             if offload_model:
@@ -269,6 +315,11 @@ class WanT2V:
                 torch.cuda.empty_cache()
             if self.rank == 0:
                 videos = self.vae.decode(x0)
+                if progress_callback:
+                    try:
+                        progress_callback(total_steps, total_steps, "finalize")
+                    except Exception:
+                        pass
 
         del noise, latents
         del sample_scheduler
