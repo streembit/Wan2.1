@@ -35,3 +35,19 @@ Wan2.1-T2V-1.3B/
 Wan2.1-I2V-14B-480P/
 Wan2.1-I2V-14B-720P/
 poetry.lock
+
+# Experimental and test files (moved to parent directory)
+test_*.py
+benchmark_*.py
+*_test.py
+*ferrari*.py
+run_14b*.py
+wan_*_loader.py
+generate_14b*.py
+
+# Experiment documentation  
+14B_*.md
+README_14B*.md
+SOLUTION_*.md
+
+# Keep the repository focused on core functionality
